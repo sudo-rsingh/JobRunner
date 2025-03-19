@@ -24,6 +24,15 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
     
+    - name: Create temporary key pair
+      id: create-key-pair
+      run: |
+        # Create a temporary key pair
+        KEY_NAME="github-action-$(date +%s)"
+        aws ec2 create-key-pair --key-name "$KEY_NAME" --query 'KeyMaterial' --output text > private_key.pem
+        chmod 600 private_key.pem
+        echo "key_name=$KEY_NAME" >> $GITHUB_ENV
+    
     - name: Launch EC2 instance
       id: launch-ec2
       run: |
@@ -31,9 +40,11 @@ jobs:
         INSTANCE_ID=$(aws ec2 run-instances \
           --image-id ${{ env.AMI_ID }} \
           --instance-type ${{ env.INSTANCE_TYPE }} \
+          --key-name ${{ env.key_name }} \
           --security-group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
           --subnet-id ${{ secrets.AWS_SUBNET_ID }} \
           --associate-public-ip-address \
+          --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":8,"DeleteOnTermination":true}}]' \
           --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=GithubActionRunner}]' \
           --query 'Instances[0].InstanceId' \
           --output text)
@@ -90,14 +101,12 @@ jobs:
         done
     
     - name: Run Python script on EC2
-      env:
-        SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
       run: |
-        # Setup SSH key
-        echo "$SSH_PRIVATE_KEY" > private_key.pem
-        chmod 600 private_key.pem
+        # Copy files to EC2
+        scp -i private_key.pem -o StrictHostKeyChecking=no \
+          *.py requirements.txt* ec2-user@${PUBLIC_IP}:~/
         
-        # Create a setup script for Python environment
+        # Create and copy setup script
         cat << 'EOF' > setup.sh
         #!/bin/bash
         sudo yum update -y
@@ -108,13 +117,12 @@ jobs:
         fi
         EOF
         
-        # Copy files to EC2
-        scp -i private_key.pem -o StrictHostKeyChecking=no \
-          setup.sh *.py requirements.txt* ec2-user@${PUBLIC_IP}:~/
+        chmod +x setup.sh
+        scp -i private_key.pem -o StrictHostKeyChecking=no setup.sh ec2-user@${PUBLIC_IP}:~/
         
         # Setup Python environment and run script
         ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@${PUBLIC_IP} \
-          "chmod +x setup.sh && ./setup.sh && python3 *.py > output.txt 2>&1"
+          "cd ~/ && chmod +x setup.sh && ./setup.sh && python3 *.py > output.txt 2>&1"
         
         # Get the results back
         scp -i private_key.pem -o StrictHostKeyChecking=no \
@@ -126,12 +134,19 @@ jobs:
         name: python-script-results
         path: output.txt
     
-    - name: Terminate EC2 instance
+    - name: Cleanup
       if: always()  # Run even if previous steps failed
       run: |
-        aws ec2 terminate-instances \
-          --instance-ids ${{ env.INSTANCE_ID }}
+        # Terminate the instance
+        if [ -n "$INSTANCE_ID" ]; then
+          aws ec2 terminate-instances --instance-ids ${{ env.INSTANCE_ID }}
+          aws ec2 wait instance-terminated --instance-ids ${{ env.INSTANCE_ID }}
+        fi
         
-        # Wait for instance to be terminated
-        aws ec2 wait instance-terminated \
-          --instance-ids ${{ env.INSTANCE_ID }} 
+        # Delete the temporary key pair
+        if [ -n "${{ env.key_name }}" ]; then
+          aws ec2 delete-key-pair --key-name ${{ env.key_name }}
+        fi
+        
+        # Remove the private key file
+        rm -f private_key.pem 
