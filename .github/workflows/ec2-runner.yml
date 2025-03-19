@@ -27,36 +27,55 @@ jobs:
     - name: Verify Security Group
       run: |
         # Get GitHub Actions IP
-        GITHUB_IP=$(curl -s https://api.github.com/meta | jq -r '.actions[0]')
-        echo "GitHub Actions IP: $GITHUB_IP"
+        RUNNER_IP=$(curl -s ifconfig.me)
+        echo "GitHub Actions runner IP: $RUNNER_IP"
         
-        # Check security group rules
-        echo "Checking security group rules..."
-        aws ec2 describe-security-groups \
-          --group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
-          --query 'SecurityGroups[0].IpPermissions[*]' \
-          --output json
+        # Create a new security group
+        echo "Creating new security group..."
+        SG_ID=$(aws ec2 create-security-group \
+          --group-name github-action-runner-sg-$(date +%s) \
+          --description "Temporary Security group for GitHub Actions runner" \
+          --vpc-id ${{ secrets.AWS_VPC_ID }} \
+          --query 'GroupId' --output text)
         
-        # Create a temporary security group if needed
-        if ! aws ec2 describe-security-groups --group-ids ${{ secrets.AWS_SECURITY_GROUP }} 2>/dev/null; then
-          echo "Creating new security group..."
-          SG_ID=$(aws ec2 create-security-group \
-            --group-name github-action-runner-sg \
-            --description "Security group for GitHub Actions runner" \
-            --vpc-id ${{ secrets.AWS_VPC_ID }} \
-            --query 'GroupId' --output text)
-          
-          # Allow SSH from GitHub Actions IP
-          aws ec2 authorize-security-group-ingress \
-            --group-id $SG_ID \
-            --protocol tcp \
-            --port 22 \
-            --cidr 0.0.0.0/0
-          
-          echo "SECURITY_GROUP_ID=${SG_ID}" >> $GITHUB_ENV
-        else
-          echo "SECURITY_GROUP_ID=${{ secrets.AWS_SECURITY_GROUP }}" >> $GITHUB_ENV
-        fi
+        echo "Created security group: $SG_ID"
+        echo "SECURITY_GROUP_ID=${SG_ID}" >> $GITHUB_ENV
+        
+        # Allow SSH from the runner's IP
+        echo "Adding SSH ingress rule for $RUNNER_IP"
+        aws ec2 authorize-security-group-ingress \
+          --group-id $SG_ID \
+          --protocol tcp \
+          --port 22 \
+          --cidr ${RUNNER_IP}/32
+        
+        # Allow all outbound traffic
+        aws ec2 authorize-security-group-egress \
+          --group-id $SG_ID \
+          --protocol all \
+          --port -1 \
+          --cidr 0.0.0.0/0
+        
+        # Verify security group configuration
+        echo "Security group configuration:"
+        aws ec2 describe-security-groups --group-ids $SG_ID --output json
+        
+        # Check VPC and subnet configuration
+        echo "VPC configuration:"
+        aws ec2 describe-vpcs --vpc-ids ${{ secrets.AWS_VPC_ID }} --output json
+        
+        echo "Subnet configuration:"
+        aws ec2 describe-subnets --subnet-ids ${{ secrets.AWS_SUBNET_ID }} --output json
+        
+        # Check route tables
+        SUBNET_INFO=$(aws ec2 describe-subnets --subnet-ids ${{ secrets.AWS_SUBNET_ID }} --output json)
+        VPC_ID=$(echo "$SUBNET_INFO" | jq -r '.Subnets[0].VpcId')
+        ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+          --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.subnet-id,Values=${{ secrets.AWS_SUBNET_ID }}" \
+          --query 'RouteTables[0].RouteTableId' --output text)
+        
+        echo "Route table configuration:"
+        aws ec2 describe-route-tables --route-table-ids $ROUTE_TABLE_ID --output json
     
     - name: Create temporary key pair
       id: create-key-pair
@@ -70,7 +89,15 @@ jobs:
     - name: Launch EC2 instance
       id: launch-ec2
       run: |
-        # Launch the instance and capture its ID
+        # Create user data script
+        cat << 'EOF' > user_data.sh
+        #!/bin/bash
+        yum update -y
+        yum install -y nc
+        systemctl restart sshd
+        EOF
+        
+        # Launch the instance with user data
         INSTANCE_ID=$(aws ec2 run-instances \
           --image-id ${{ env.AMI_ID }} \
           --instance-type ${{ env.INSTANCE_TYPE }} \
@@ -78,6 +105,8 @@ jobs:
           --security-group-ids ${{ env.SECURITY_GROUP_ID }} \
           --subnet-id ${{ secrets.AWS_SUBNET_ID }} \
           --associate-public-ip-address \
+          --monitoring Enabled=true \
+          --user-data file://user_data.sh \
           --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":8,"DeleteOnTermination":true}}]' \
           --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=GithubActionRunner}]' \
           --query 'Instances[0].InstanceId' \
@@ -117,6 +146,10 @@ jobs:
         echo "Instance details:"
         aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
         
+        # Get instance console output for debugging
+        echo "Instance console output:"
+        aws ec2 get-console-output --instance-id $INSTANCE_ID || echo "No console output available yet"
+        
         # Wait for SSH to be available with increased timeout and debugging
         echo "Waiting for SSH to become available at $PUBLIC_IP..."
         MAX_SSH_ATTEMPTS=30
@@ -126,7 +159,7 @@ jobs:
           echo "SSH connection attempt $SSH_ATTEMPT of $MAX_SSH_ATTEMPTS..."
           
           # Try to establish SSH connection with verbose output
-          if ssh -i private_key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=5 -v ec2-user@${PUBLIC_IP} "echo 'SSH connection successful'" 2>ssh_debug.log; then
+          if ssh -i private_key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=10 -v ec2-user@${PUBLIC_IP} "echo 'SSH connection successful'" 2>ssh_debug.log; then
             echo "SSH is available!"
             cat ssh_debug.log
             break
@@ -139,6 +172,8 @@ jobs:
             echo "Failed to establish SSH connection after $MAX_SSH_ATTEMPTS attempts"
             echo "Final instance state:"
             aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
+            echo "Security group rules:"
+            aws ec2 describe-security-groups --group-ids ${{ env.SECURITY_GROUP_ID }} --output json
             exit 1
           fi
           
