@@ -23,6 +23,40 @@ jobs:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
+
+    - name: Verify Security Group
+      run: |
+        # Get GitHub Actions IP
+        GITHUB_IP=$(curl -s https://api.github.com/meta | jq -r '.actions[0]')
+        echo "GitHub Actions IP: $GITHUB_IP"
+        
+        # Check security group rules
+        echo "Checking security group rules..."
+        aws ec2 describe-security-groups \
+          --group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
+          --query 'SecurityGroups[0].IpPermissions[*]' \
+          --output json
+        
+        # Create a temporary security group if needed
+        if ! aws ec2 describe-security-groups --group-ids ${{ secrets.AWS_SECURITY_GROUP }} 2>/dev/null; then
+          echo "Creating new security group..."
+          SG_ID=$(aws ec2 create-security-group \
+            --group-name github-action-runner-sg \
+            --description "Security group for GitHub Actions runner" \
+            --vpc-id ${{ secrets.AWS_VPC_ID }} \
+            --query 'GroupId' --output text)
+          
+          # Allow SSH from GitHub Actions IP
+          aws ec2 authorize-security-group-ingress \
+            --group-id $SG_ID \
+            --protocol tcp \
+            --port 22 \
+            --cidr 0.0.0.0/0
+          
+          echo "SECURITY_GROUP_ID=${SG_ID}" >> $GITHUB_ENV
+        else
+          echo "SECURITY_GROUP_ID=${{ secrets.AWS_SECURITY_GROUP }}" >> $GITHUB_ENV
+        fi
     
     - name: Create temporary key pair
       id: create-key-pair
@@ -41,7 +75,7 @@ jobs:
           --image-id ${{ env.AMI_ID }} \
           --instance-type ${{ env.INSTANCE_TYPE }} \
           --key-name ${{ env.key_name }} \
-          --security-group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
+          --security-group-ids ${{ env.SECURITY_GROUP_ID }} \
           --subnet-id ${{ secrets.AWS_SUBNET_ID }} \
           --associate-public-ip-address \
           --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":8,"DeleteOnTermination":true}}]' \
@@ -79,20 +113,32 @@ jobs:
           sleep 10
         done
         
-        # Wait for SSH to be available with increased timeout
+        # Debug instance information
+        echo "Instance details:"
+        aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
+        
+        # Wait for SSH to be available with increased timeout and debugging
         echo "Waiting for SSH to become available at $PUBLIC_IP..."
         MAX_SSH_ATTEMPTS=30
         SSH_ATTEMPT=1
         
         while [ $SSH_ATTEMPT -le $MAX_SSH_ATTEMPTS ]; do
           echo "SSH connection attempt $SSH_ATTEMPT of $MAX_SSH_ATTEMPTS..."
-          if nc -z -w 5 $PUBLIC_IP 22; then
+          
+          # Try to establish SSH connection with verbose output
+          if ssh -i private_key.pem -o StrictHostKeyChecking=no -o ConnectTimeout=5 -v ec2-user@${PUBLIC_IP} "echo 'SSH connection successful'" 2>ssh_debug.log; then
             echo "SSH is available!"
+            cat ssh_debug.log
             break
           fi
           
+          echo "SSH connection failed. Debug output:"
+          cat ssh_debug.log
+          
           if [ $SSH_ATTEMPT -eq $MAX_SSH_ATTEMPTS ]; then
             echo "Failed to establish SSH connection after $MAX_SSH_ATTEMPTS attempts"
+            echo "Final instance state:"
+            aws ec2 describe-instances --instance-ids $INSTANCE_ID --output json
             exit 1
           fi
           
@@ -146,6 +192,11 @@ jobs:
         # Delete the temporary key pair
         if [ -n "${{ env.key_name }}" ]; then
           aws ec2 delete-key-pair --key-name ${{ env.key_name }}
+        fi
+        
+        # Cleanup temporary security group if we created one
+        if [ "${{ env.SECURITY_GROUP_ID }}" != "${{ secrets.AWS_SECURITY_GROUP }}" ]; then
+          aws ec2 delete-security-group --group-id ${{ env.SECURITY_GROUP_ID }}
         fi
         
         # Remove the private key file
