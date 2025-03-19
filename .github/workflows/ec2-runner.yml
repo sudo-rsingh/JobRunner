@@ -1,0 +1,104 @@
+name: EC2 Runner Workflow
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1  # Change this to your desired region
+  INSTANCE_TYPE: t2.micro  # Change this to your desired instance type
+  AMI_ID: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI ID
+
+jobs:
+  run-on-ec2:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Launch EC2 instance
+      id: launch-ec2
+      run: |
+        INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ${{ env.AMI_ID }} \
+          --instance-type ${{ env.INSTANCE_TYPE }} \
+          --security-group-ids ${{ secrets.AWS_SECURITY_GROUP }} \
+          --subnet-id ${{ secrets.AWS_SUBNET_ID }} \
+          --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=GithubActionRunner}]' \
+          --query 'Instances[0].InstanceId' \
+          --output text)
+        echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+        
+        # Wait for instance to be running
+        aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+        
+        # Get public IP
+        PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids $INSTANCE_ID \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' \
+          --output text)
+        echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+        
+        # Wait for SSH to be available
+        for i in {1..30}; do
+          if nc -zw 1 $PUBLIC_IP 22; then
+            break
+          fi
+          sleep 10
+        done
+    
+    - name: Run Python script on EC2
+      env:
+        INSTANCE_IP: ${{ steps.launch-ec2.outputs.public_ip }}
+        SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      run: |
+        # Setup SSH key
+        echo "$SSH_PRIVATE_KEY" > private_key.pem
+        chmod 600 private_key.pem
+        
+        # Create a setup script for Python environment
+        cat << 'EOF' > setup.sh
+        #!/bin/bash
+        sudo yum update -y
+        sudo yum install -y python3 python3-pip
+        python3 -m pip install --upgrade pip
+        if [ -f "requirements.txt" ]; then
+          python3 -m pip install -r requirements.txt
+        fi
+        EOF
+        
+        # Copy files to EC2
+        scp -i private_key.pem -o StrictHostKeyChecking=no \
+          setup.sh *.py requirements.txt* ec2-user@${INSTANCE_IP}:~/
+        
+        # Setup Python environment and run script
+        ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@${INSTANCE_IP} \
+          "chmod +x setup.sh && ./setup.sh && python3 *.py > output.txt 2>&1"
+        
+        # Get the results back
+        scp -i private_key.pem -o StrictHostKeyChecking=no \
+          ec2-user@${INSTANCE_IP}:~/output.txt ./
+    
+    - name: Upload results as artifact
+      uses: actions/upload-artifact@v2
+      with:
+        name: python-script-results
+        path: output.txt
+    
+    - name: Terminate EC2 instance
+      if: always()  # Run even if previous steps failed
+      run: |
+        aws ec2 terminate-instances \
+          --instance-ids ${{ steps.launch-ec2.outputs.instance_id }}
+        
+        # Wait for instance to be terminated
+        aws ec2 wait instance-terminated \
+          --instance-ids ${{ steps.launch-ec2.outputs.instance_id }} 
